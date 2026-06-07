@@ -63,34 +63,46 @@ def train_dqn(Xtr, ytr, Xte, cfg, use_lambda=True, seed=0, n_classes=6, epochs=8
     counts = np.bincount(ytr, minlength=n_classes)
     lam = M.lambda_c_from_counts(counts) if use_lambda else np.ones(n_classes)
 
-    n_actions = cfg["n_actions"]
+    # Family-level DQN: one action per class. The agent predicts a family;
+    # the reward rewards the correct family (+alpha) and penalises a wrong call
+    # by an amount scaled by the class-frequency weight of the TRUE family, so
+    # misclassifying a rare attack (e.g. Worms) is far costlier than a common
+    # one. This is what lets lambda_c = log(N/N_c) drive rare-class recall.
+    n_actions = n_classes
     q = M.build_q_network(Xtr.shape[1], n_actions, cfg["embed_dim"])
     opt = optimizers.Adam(cfg["lr"])
 
-    # --- Vectorized reward lookup tables (computed once) ---------------------
-    # For action a and true class c the immediate reward is:
-    #   attack (c!=0):  allow(0) -> -beta*lambda_c[c] ; alert/block -> +alpha
-    #   normal (c==0):  block(2) -> -phi              ; allow/alert  -> +alpha
-    # Build a (n_classes x n_actions) table so reward is a single gather.
-    alpha, beta, phi = cfg["alpha"], cfg["beta"], cfg["phi"]
-    R = np.full((n_classes, n_actions), 0.0, dtype=np.float32)
+    alpha = cfg["alpha"]
+    # Reward table R[true_class, action]:
+    #   correct  (action == true)            -> +alpha * lambda_c[true]   (rare correct worth more)
+    #   incorrect(action != true)            -> -lambda_c[true]           (missing rare costs more)
+    R = np.zeros((n_classes, n_actions), dtype=np.float32)
     for c in range(n_classes):
-        if c == 0:                      # Normal: reward allowing, penalise blocking/alerting
-            R[c, 0] = alpha             # allow benign -> +alpha
-            R[c, 1] = -phi * 0.5        # alerting on benign -> mild penalty
-            R[c, 2] = -phi              # blocking benign -> full penalty
-        else:                           # attack family
-            R[c, 0] = -beta * lam[c]    # missing the attack -> penalty scaled by rarity
-            R[c, 1] = alpha             # alerting on attack -> +alpha
-            R[c, 2] = alpha             # blocking attack -> +alpha
+        for a in range(n_actions):
+            R[c, a] = alpha * lam[c] if a == c else -lam[c]
     R_tf = tf.constant(R)
 
     batch = cfg["batch"]
     eps_start, eps_end = cfg["eps_start"], cfg["eps_end"]
 
-    # data pipeline on device
-    ds = (tf.data.Dataset.from_tensor_slices((Xtr_r, ytr.astype(np.int64)))
-          .shuffle(min(len(ytr), 20000)).batch(batch).prefetch(tf.data.AUTOTUNE))
+    # Class-balanced sampling: with extreme imbalance the agent almost never
+    # sees rare classes, so the frequency-aware reward cannot take hold. We
+    # build a per-sample weight inversely proportional to class frequency and
+    # sample mini-batches from it, so rare families appear often enough to learn.
+    # When use_lambda is False (plain_dqn ablation) sampling is uniform, keeping
+    # the comparison clean: cfa_dqn = freq-aware reward + freq-aware sampling,
+    # plain_dqn = neither.
+    if use_lambda:
+        w = (1.0 / np.maximum(counts, 1))[ytr]
+        w = (w / w.sum()).astype(np.float64)
+        sample_idx = rng_choice = np.random.default_rng(seed).choice(
+            len(ytr), size=len(ytr), replace=True, p=w)
+        Xs, ys = Xtr_r[sample_idx], ytr[sample_idx].astype(np.int64)
+    else:
+        Xs, ys = Xtr_r, ytr.astype(np.int64)
+
+    ds = (tf.data.Dataset.from_tensor_slices((Xs, ys))
+          .shuffle(min(len(ys), 20000)).batch(batch).prefetch(tf.data.AUTOTUNE))
 
     @tf.function
     def train_step(xb, yb, eps):
@@ -99,10 +111,8 @@ def train_dqn(Xtr, ytr, Xte, cfg, use_lambda=True, seed=0, n_classes=6, epochs=8
         rnd = tf.random.uniform(tf.shape(greedy), 0, n_actions, dtype=tf.int32)
         explore = tf.random.uniform(tf.shape(greedy)) < eps
         acts = tf.where(explore, rnd, greedy)
-        # immediate reward via gather on (class, action) table
         ca = tf.stack([yb, acts], axis=1)
         rew = tf.gather_nd(R_tf, ca)
-        # target = current q with the taken action's value replaced by reward
         oh = tf.one_hot(acts, n_actions)
         target = qvals * (1.0 - oh) + rew[:, None] * oh
         with tf.GradientTape() as tape:
@@ -119,8 +129,7 @@ def train_dqn(Xtr, ytr, Xte, cfg, use_lambda=True, seed=0, n_classes=6, epochs=8
             train_step(xb, tf.cast(yb, tf.int32), eps_t)
 
     q_te = q.predict(Xte_r, batch_size=2048, verbose=0)
-    actions = q_te.argmax(axis=1)
-    return _binary_from_actions(actions)
+    return q_te.argmax(axis=1).astype(np.int64)  # family-level prediction
 
 
 def train_supervised(Xtr, ytr, Xte, cfg, focal=False, seed=0, n_classes=6, epochs=8):
@@ -155,10 +164,10 @@ def train_supervised(Xtr, ytr, Xte, cfg, focal=False, seed=0, n_classes=6, epoch
 def predict(method, Xtr, ytr, Xte, cfg, seed, n_classes, epochs=8):
     if method == "cfa_dqn":
         return train_dqn(Xtr, ytr, Xte, cfg, use_lambda=True, seed=seed,
-                         n_classes=n_classes, epochs=epochs), "binary"
+                         n_classes=n_classes, epochs=epochs), "multiclass"
     if method == "plain_dqn":
         return train_dqn(Xtr, ytr, Xte, cfg, use_lambda=False, seed=seed,
-                         n_classes=n_classes, epochs=epochs), "binary"
+                         n_classes=n_classes, epochs=epochs), "multiclass"
     if method == "ce":
         return train_supervised(Xtr, ytr, Xte, cfg, focal=False, seed=seed,
                                  n_classes=n_classes, epochs=epochs), "multiclass"
