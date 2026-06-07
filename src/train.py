@@ -66,42 +66,61 @@ def train_dqn(Xtr, ytr, Xte, cfg, use_lambda=True, seed=0, n_classes=6, epochs=8
     n_actions = cfg["n_actions"]
     q = M.build_q_network(Xtr.shape[1], n_actions, cfg["embed_dim"])
     opt = optimizers.Adam(cfg["lr"])
-    huber = losses.Huber(delta=cfg["huber_delta"])
 
-    n = Xtr_r.shape[0]
+    # --- Vectorized reward lookup tables (computed once) ---------------------
+    # For action a and true class c the immediate reward is:
+    #   attack (c!=0):  allow(0) -> -beta*lambda_c[c] ; alert/block -> +alpha
+    #   normal (c==0):  block(2) -> -phi              ; allow/alert  -> +alpha
+    # Build a (n_classes x n_actions) table so reward is a single gather.
+    alpha, beta, phi = cfg["alpha"], cfg["beta"], cfg["phi"]
+    R = np.full((n_classes, n_actions), 0.0, dtype=np.float32)
+    for c in range(n_classes):
+        if c == 0:                      # Normal: reward allowing, penalise blocking/alerting
+            R[c, 0] = alpha             # allow benign -> +alpha
+            R[c, 1] = -phi * 0.5        # alerting on benign -> mild penalty
+            R[c, 2] = -phi              # blocking benign -> full penalty
+        else:                           # attack family
+            R[c, 0] = -beta * lam[c]    # missing the attack -> penalty scaled by rarity
+            R[c, 1] = alpha             # alerting on attack -> +alpha
+            R[c, 2] = alpha             # blocking attack -> +alpha
+    R_tf = tf.constant(R)
+
     batch = cfg["batch"]
-    eps = cfg["eps_start"]
-    eps_step = (cfg["eps_start"] - cfg["eps_end"]) / max(epochs, 1)
+    eps_start, eps_end = cfg["eps_start"], cfg["eps_end"]
+
+    # data pipeline on device
+    ds = (tf.data.Dataset.from_tensor_slices((Xtr_r, ytr.astype(np.int64)))
+          .shuffle(min(len(ytr), 20000)).batch(batch).prefetch(tf.data.AUTOTUNE))
+
+    @tf.function
+    def train_step(xb, yb, eps):
+        qvals = q(xb, training=True)
+        greedy = tf.argmax(qvals, axis=1, output_type=tf.int32)
+        rnd = tf.random.uniform(tf.shape(greedy), 0, n_actions, dtype=tf.int32)
+        explore = tf.random.uniform(tf.shape(greedy)) < eps
+        acts = tf.where(explore, rnd, greedy)
+        # immediate reward via gather on (class, action) table
+        ca = tf.stack([yb, acts], axis=1)
+        rew = tf.gather_nd(R_tf, ca)
+        # target = current q with the taken action's value replaced by reward
+        oh = tf.one_hot(acts, n_actions)
+        target = qvals * (1.0 - oh) + rew[:, None] * oh
+        with tf.GradientTape() as tape:
+            pred = q(xb, training=True)
+            loss = tf.reduce_mean(tf.keras.losses.huber(target, pred))
+        grads = tape.gradient(loss, q.trainable_variables)
+        opt.apply_gradients(zip(grads, q.trainable_variables))
+        return loss
 
     for ep in range(epochs):
-        idx = np.random.permutation(n)
-        for s in range(0, n, batch):
-            b = idx[s:s + batch]
-            xb = Xtr_r[b]
-            yb = ytr[b]
-            qvals = q(xb, training=False).numpy()
-            # epsilon-greedy action selection
-            greedy = qvals.argmax(axis=1)
-            rand = np.random.randint(0, n_actions, size=len(b))
-            explore = np.random.random(len(b)) < eps
-            acts = np.where(explore, rand, greedy)
-            # immediate reward per sample
-            rew = np.array([M.reward(int(a), int(c), lam,
-                                     cfg["alpha"], cfg["beta"], cfg["phi"])
-                            for a, c in zip(acts, yb)], dtype=np.float32)
-            # TD target = reward (bandit form); update only the taken action
-            target = qvals.copy()
-            target[np.arange(len(b)), acts] = rew
-            with tf.GradientTape() as tape:
-                pred = q(xb, training=True)
-                loss = huber(target, pred)
-            grads = tape.gradient(loss, q.trainable_variables)
-            opt.apply_gradients(zip(grads, q.trainable_variables))
-        eps = max(cfg["eps_end"], eps - eps_step)
+        eps = max(eps_end, eps_start - (eps_start - eps_end) * ep / max(epochs, 1))
+        eps_t = tf.constant(eps, tf.float32)
+        for xb, yb in ds:
+            train_step(xb, tf.cast(yb, tf.int32), eps_t)
 
-    q_te = q(Xte_r, training=False).numpy()
+    q_te = q.predict(Xte_r, batch_size=2048, verbose=0)
     actions = q_te.argmax(axis=1)
-    return _binary_from_actions(actions)  # binary detection prediction
+    return _binary_from_actions(actions)
 
 
 def train_supervised(Xtr, ytr, Xte, cfg, focal=False, seed=0, n_classes=6, epochs=8):
