@@ -94,14 +94,42 @@ def train_eval_once(train_set, test_set, method, seed, processed_dir, cfg, epoch
     return rec
 
 
+def _cell_key(r):
+    return (r["train"], r["test"], r["method"], r["seed"])
+
+
 def run_matrix(processed_dir, out_path, methods, seeds, cfg, epochs):
+    # Resume: if the output file already has completed cells, keep them and
+    # skip re-running them. A disconnect mid-run therefore costs nothing -- just
+    # re-run the same command and it picks up where it stopped.
     results = []
+    done_keys = set()
+    if os.path.exists(out_path):
+        try:
+            with open(out_path) as f:
+                results = json.load(f)
+            done_keys = {_cell_key(r) for r in results}
+            print(f"resuming: {len(results)} cells already done in {out_path}")
+        except Exception:
+            results = []
+
+    def flush():
+        # atomic-ish write: temp then replace, so a crash mid-write can't
+        # corrupt the results file.
+        tmp = out_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(results, f, indent=2)
+        os.replace(tmp, out_path)
+
     for method in methods:
         for tr, te in itertools.product(DATASETS, DATASETS):
             for seed in seeds:
+                if (tr, te, method, seed) in done_keys:
+                    continue
                 try:
                     res = train_eval_once(tr, te, method, seed, processed_dir, cfg, epochs)
                     results.append(res)
+                    flush()  # <-- write after EVERY cell, not just at the end
                     tag = res.get("macro_f1", res["detection_f1"])
                     print(f"done: {method:9s} {tr}->{te:11s} seed={seed} "
                           f"det_recall={res['detection_recall']:.3f} score={tag:.3f}")
@@ -109,9 +137,9 @@ def run_matrix(processed_dir, out_path, methods, seeds, cfg, epochs):
                     print(f"skip (missing processed data): {tr}/{te} :: {e}")
                 except Exception as e:
                     print(f"ERROR {method} {tr}->{te} seed={seed}: {e}")
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+    flush()
     print(f"\nwrote {len(results)} completed cells to {out_path}")
+
 
 
 def main():
